@@ -1,6 +1,6 @@
 # Performance Analysis: llama.cpp on Nanvix
 
-> **TL;DR:** With zero-copy in-memory FAT32 filesystem (memfs), Nanvix runs LLM inference end-to-end in **20.3 s** (32 tokens) — a **14x improvement** over the original virtio-fs baseline of 283 s. Model loading dropped from 279 s to 16.3 s (**17x faster**). The memfs init overhead was eliminated (14.3 s → 0.025 s) by mounting the RAMFS MMIO region directly without copying. Per-token compute is **1.8x faster** than native x86_64 (guest-reported), thanks to AVX2/FMA enablement.
+> **TL;DR:** With batch mmap, setvbuf, and zero-copy memfs, Nanvix runs LLM inference end-to-end in **16.6 s** (32 tokens) — a **17x improvement** over the original virtio-fs baseline of 283 s. Model loading dropped from 279 s to 13.0 s (**21x faster**). Context creation improved from 2.3 s to 1.8 s (**22% faster**) via batch page mapping. At 256 tokens, the overhead ratio drops to **3.4x** as compute dominates.
 
 ---
 
@@ -48,28 +48,25 @@
 
 | Metric | Native | Nanvix (memfs) | Ratio |
 |--------|--------|----------------|-------|
-| **Total wall-clock** | 1.94 s | 20.32 s | **10.5x** |
-| **Model load (host)** | 0.558 s | 16.29 s | 29x |
-| **Generation (host)** | 1.155 s | 1.325 s | 1.1x |
-| **Token decode (guest, ms/tok)** | 36.92 ms | 20.49 ms | **1.8x faster†** |
-| **Tokens/second (guest, eval)** | 27.09 t/s | 48.81 t/s | **1.8x faster†** |
-
-†Guest-reported metrics; Nanvix with AVX2/FMA on i686 achieves faster per-token decode than native x86_64 in guest-measured time. Host wall-clock is higher due to KVM VM-exit overhead not captured by the guest clock.
+| **Total wall-clock** | 1.52 s | 16.63 s | **11.0x** |
+| **Model load (host)** | 0.467 s | 12.95 s | 28x |
+| **Generation (host)** | 0.885 s | 1.243 s | 1.4x |
+| **ctx_create (host)** | 0.010 s | 1.841 s | 184x |
 
 ### Where the Time Goes
 
 ```
-Native (1.94 s total):
-  █████████████████████████████████████████████████████████████░░ generation (60%)
-  ██████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ model_load (29%)
+Native (1.52 s total):
+  █████████████████████████████████████████████████████████████░░ generation (58%)
+  ██████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ model_load (31%)
   █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ prompt_eval (7%)
   ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ other (4%)
 
-Nanvix memfs (20.32 s total):
-  ██████████████████████████████████████████████████████████████░░ model_load (80.2%)
+Nanvix memfs (16.63 s total):
+  ██████████████████████████████████████████████████████████████░░ model_load (77.9%)
   ███████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ ctx_create (11.1%)
-  ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ generation (6.5%)
-  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ other (2.2%)
+  █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ generation (7.5%)
+  ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ other (3.5%)
 ```
 
 ---
@@ -82,47 +79,41 @@ All times are host-side wall-clock measurements.
 
 | Metric | 32 tokens | 128 tokens | 256 tokens |
 |--------|-----------|------------|------------|
-| **Native total** | 1.94 s | 4.61 s | 9.25 s |
-| **Nanvix total** | 20.32 s | 25.82 s | 32.16 s |
-| **Ratio** | 10.5x | 5.6x | 3.5x |
+| **Native total** | 1.52 s | 4.39 s | 8.51 s |
+| **Nanvix total** | 16.63 s | 22.47 s | 28.78 s |
+| **Ratio** | 11.0x | 5.1x | 3.4x |
 | | | | |
-| Native generation | 1.155 s | 3.951 s | 8.576 s |
-| Nanvix generation | 1.325 s | 7.271 s | 11.604 s |
-| Gen ratio | 1.1x | 1.8x | 1.4x |
+| Native generation | 0.885 s | 3.856 s | 7.986 s |
+| Nanvix generation | 1.243 s | 5.132 s | 11.012 s |
+| Gen ratio | 1.4x | 1.3x | 1.4x |
 | | | | |
-| Native model_load | 0.558 s | 0.421 s | 0.437 s |
-| Nanvix model_load | 16.286 s | 15.753 s | 16.791 s |
-| Load ratio | 29x | 37x | 38x |
+| Native model_load | 0.467 s | 0.314 s | 0.311 s |
+| Nanvix model_load | 12.953 s | 14.555 s | 14.333 s |
+| Load ratio | 28x | 46x | 46x |
 | | | | |
-| Nanvix ctx_create | 2.264 s | 2.222 s | 3.231 s |
-| Nanvix memfs_init | 0.025 s | 0.019 s | 0.024 s |
+| Nanvix ctx_create | 1.841 s | 1.974 s | 2.702 s |
+| Nanvix memfs_init | 0.029 s | 0.026 s | 0.026 s |
 
 ### Key Insight: Amortization
 
-The fixed-cost phases (model load: ~16 s, ctx_create: ~2.5 s, boot: ~0.2 s) are amortized over more tokens. At 256 tokens, generation dominates and the Nanvix-to-native ratio drops to **3.5x**. Extrapolating:
+The fixed-cost phases (model load: ~14 s, ctx_create: ~2 s, boot: ~0.2 s) are amortized over more tokens. At 256 tokens, generation dominates and the Nanvix-to-native ratio drops to **3.4x**. Extrapolating:
 
 | Tokens | Estimated Nanvix total | Ratio vs native |
 |--------|----------------------|-----------------|
-| 512 | ~42 s | 2.7x |
-| 1024 | ~62 s | 2.3x |
-| 4096 | ~180 s | 1.9x |
+| 512 | ~40 s | 2.6x |
+| 1024 | ~62 s | 2.1x |
+| 4096 | ~172 s | 1.8x |
 
-The asymptotic ratio converges toward the pure compute overhead (~1.4–1.8x host wall-clock), which is dominated by KVM scheduling overhead rather than ISA limitations.
+The asymptotic ratio converges toward the pure compute overhead (~1.4x host wall-clock), which is dominated by KVM scheduling overhead rather than ISA limitations.
 
 ### Guest-Reported Decode Performance
 
-| Config | 32 tokens | 128 tokens | 256 tokens |
-|--------|-----------|------------|------------|
-| Native (ms/tok) | 36.92 | 30.83 | 33.33 |
-| Nanvix (ms/tok) | 20.49 | 27.87 | 22.14 |
-| **Nanvix speedup** | **1.8x** | **1.1x** | **1.5x** |
-
-The guest-reported per-token decode is consistently faster on Nanvix than on native x86_64. This is because:
+The guest-reported per-token decode is consistently competitive with native x86_64. This is because:
 1. AVX2/FMA SIMD operations process the same width (256-bit) on both architectures
 2. The Q4_K_M dequantization kernels are dominated by SIMD throughput, not register count
 3. The guest clock does not account for KVM VM-exit time (timer interrupts, APIC emulation)
 
-The difference between guest-reported and host-measured generation time represents KVM virtualization overhead (~20 ms per token).
+The difference between guest-reported and host-measured generation time represents KVM virtualization overhead.
 
 ---
 
@@ -134,40 +125,40 @@ All times are wall-clock measurements taken from the host side by timestamping `
 
 | Phase | Native | Nanvix (memfs) | Ratio |
 |-------|--------|----------------|-------|
-| `nanvixd_boot` | — | 0.178 s | — |
+| `nanvixd_boot` | — | 0.207 s | — |
 | `backend_init` | 0.000 s | 0.002 s | — |
-| `memfs_init` | — | 0.025 s | — |
-| **`model_load`** | **0.558 s** | **16.286 s** | **29x** |
+| `memfs_init` | — | 0.029 s | — |
+| **`model_load`** | **0.467 s** | **12.953 s** | **28x** |
 | `tokenize` | 0.002 s | 0.004 s | 2x |
-| `ctx_create` | 0.014 s | 2.264 s | 162x |
-| `prompt_eval` | 0.137 s | 0.150 s | 1.1x |
-| `generation` | 1.155 s | 1.325 s | 1.1x |
-| `cleanup/exit` | 0.062 s | 0.080 s | 1.3x |
-| **Total** | **1.941 s** | **20.316 s** | **10.5x** |
+| `ctx_create` | 0.010 s | 1.841 s | 184x |
+| `prompt_eval` | 0.102 s | 0.269 s | 2.6x |
+| `generation` | 0.885 s | 1.243 s | 1.4x |
+| `cleanup/exit` | 0.039 s | 0.082 s | 2.1x |
+| **Total** | **1.516 s** | **16.632 s** | **11.0x** |
 
 ### 128 Tokens (prompt: "Explain the theory of general relativity in detail")
 
 | Phase | Native | Nanvix (memfs) | Ratio |
 |-------|--------|----------------|-------|
-| `nanvixd_boot` | — | 0.160 s | — |
-| `memfs_init` | — | 0.019 s | — |
-| **`model_load`** | **0.421 s** | **15.753 s** | **37x** |
-| `ctx_create` | 0.009 s | 2.222 s | 247x |
-| `prompt_eval` | 0.167 s | 0.319 s | 1.9x |
-| `generation` | 3.951 s | 7.271 s | 1.8x |
-| **Total** | **4.607 s** | **25.823 s** | **5.6x** |
+| `nanvixd_boot` | — | 0.192 s | — |
+| `memfs_init` | — | 0.026 s | — |
+| **`model_load`** | **0.314 s** | **14.555 s** | **46x** |
+| `ctx_create` | 0.005 s | 1.974 s | 395x |
+| `prompt_eval` | 0.157 s | 0.517 s | 3.3x |
+| `generation` | 3.856 s | 5.132 s | 1.3x |
+| **Total** | **4.385 s** | **22.468 s** | **5.1x** |
 
 ### 256 Tokens (prompt: "Write a comprehensive guide to machine learning")
 
 | Phase | Native | Nanvix (memfs) | Ratio |
 |-------|--------|----------------|-------|
-| `nanvixd_boot` | — | 0.157 s | — |
-| `memfs_init` | — | 0.024 s | — |
-| **`model_load`** | **0.437 s** | **16.791 s** | **38x** |
-| `ctx_create` | 0.017 s | 3.231 s | 190x |
-| `prompt_eval` | 0.162 s | 0.252 s | 1.6x |
-| `generation` | 8.576 s | 11.604 s | 1.4x |
-| **Total** | **9.253 s** | **32.162 s** | **3.5x** |
+| `nanvixd_boot` | — | 0.181 s | — |
+| `memfs_init` | — | 0.026 s | — |
+| **`model_load`** | **0.311 s** | **14.333 s** | **46x** |
+| `ctx_create` | 0.009 s | 2.702 s | 300x |
+| `prompt_eval` | 0.156 s | 0.434 s | 2.8x |
+| `generation` | 7.986 s | 11.012 s | 1.4x |
+| **Total** | **8.513 s** | **28.782 s** | **3.4x** |
 
 ### Guest-Reported Performance (from llama_perf)
 
@@ -182,28 +173,19 @@ All times are wall-clock measurements taken from the host side by timestamping `
 
 ## Root Cause Analysis
 
-### 1. Model Loading — 29–38x Slower
+### 1. Model Loading — 28–46x Slower
 
-**Symptom:** Loading the 462 MB GGUF model takes ~16 seconds on Nanvix vs ~0.5 seconds natively.
+**Symptom:** Loading the 462 MB GGUF model takes ~13–14 seconds on Nanvix vs ~0.3–0.5 seconds natively.
 
-**Root cause:** The GGUF loader issues many small `fread()` and `fseek()` calls. Each call traverses the full POSIX stack even though data is served from memory:
+**Root cause:** The dominant cost is **heap allocation**, not I/O. When the GGUF loader allocates ~462 MB for tensor weights via `malloc`, the Nanvix heap must grow from 0 to 462 MB by mapping ~118,000 pages. Each page map requires a kernel call. With batch mmap (see Phase 5), pages are mapped in chunks of ~1024 in a single kernel trap, but the per-page kernel work (frame allocation + page table update) still takes ~100 μs per page.
 
-```
-Application (fread)
-  → newlib libc (read syscall)
-    → Nanvix POSIX layer (libposix.a)
-      → memfs intercept → DirectRead memcpy
-    → Return to libc
-  → Next fread chunk
-```
+The I/O itself is fast: with 256 KB stdio buffers (via setvbuf), reading 462 MB from the in-memory FAT32 takes only ~0.6 s via `fread`, or ~0.04 s via direct `read()`.
 
-While VM exits are eliminated, the function call depth and small transfer sizes (often 4–32 bytes for metadata) create overhead for 462 MB of data. The zero-copy `DirectRead` serves reads via direct memcpy from the MMIO region, but the GGUF loader's access pattern (many seeks + small reads for tensor metadata, then large reads for tensor data) means thousands of round-trips through the POSIX layer.
+### 2. Context Creation — 184–395x Slower
 
-### 2. Context Creation — 162–247x Slower
+**Symptom:** `llama_init_from_model()` takes 1.8–2.7 seconds on Nanvix vs 5–10 ms natively.
 
-**Symptom:** `llama_init_from_model()` takes 2.2–3.2 seconds on Nanvix vs 9–17 ms natively.
-
-**Root cause:** Large memory allocation overhead. Context creation allocates the KV cache and compute buffers (~33 MB for 256-token context). On Nanvix, heap growth requires kernel interactions per page. Bulk heap growth (1 MB chunks) helps but doesn't eliminate the overhead for hundreds of pages.
+**Root cause:** KV cache and compute buffer allocation (~33 MB for 256-token context). Same per-page kernel overhead as model loading, but smaller total. Batch mmap reduces this from 2.3 s → 1.8 s (22% improvement).
 
 ### 3. Generation — 1.1–1.8x Slower (host) / 1.1–1.8x Faster (guest)
 
@@ -249,7 +231,18 @@ Model load dropped from 279s → 18s (15.4x faster). But memfs_init added 14.3s 
 | Batch stdout output | generation: ~1.5s → 1.3s per 32 tokens |
 | Model load improved | 18.1s → 16.3s (less heap pressure) |
 
-**End-to-end: 283s → 20.3s (13.9x improvement)**
+### Phase 5: + batch mmap, setvbuf, 4MB heap growth — 16.6 s total
+
+| Change | Improvement |
+|--------|-------------|
+| Batch mmap kernel call | Reduces 118K `int 0x80` traps to ~115 for heap growth |
+| 256 KB stdio buffer (setvbuf) | Reduces fread syscalls from ~462K to ~1,800 |
+| 4 MB heap growth chunks | Fewer OOM handler invocations |
+| Single process lookup per batch | Eliminates per-page process table scan |
+| model_load | 16.3s → 13.0s (**20% faster**) |
+| ctx_create | 2.3s → 1.8s (**22% faster**) |
+
+**End-to-end: 283s → 16.6s (17.0x improvement)**
 
 ---
 
@@ -331,19 +324,20 @@ g++ -O2 -std=c++17 -Iinclude -Iggml/include \
 | 1 | **Zero-copy in-memory FAT32 filesystem** — mount RAMFS MMIO region directly as FAT32 storage, intercept POSIX syscalls, serve reads via direct memcpy from guest memory | model_load | 279s → 16s (**17x**) | **Done** ✅ |
 | 2 | **Eliminate RAMFS copy** — use MMIO pointer directly for FAT32 mount instead of copying 486 MB to heap | memfs_init | 14.3s → 0.025s (**572x**) | **Done** ✅ |
 | 3 | **AVX/AVX2/FMA enablement** — expose SSE3–AVX2 via CPUID, configure XCR0/CR4.OSXSAVE via KVM ioctls | generation | 4.27s → 1.33s (**3.2x**) | **Done** ✅ |
-| 4 | **Bulk heap growth** — grow heap in 1 MB chunks instead of page-by-page | ctx_create | Reduced from ~2.5s | **Done** ✅ |
+| 4 | **Bulk heap growth** — grow heap in 4 MB chunks instead of page-by-page | ctx_create | Reduced from ~2.5s | **Done** ✅ |
 | 5 | **Batch stdout output** — remove per-token fflush() to reduce VM exits during generation | generation | ~6 ms/tok saved | **Done** ✅ |
 | 6 | **LOG_LEVEL=panic** — eliminates runtime log formatting | all phases | minor | **Done** ✅ |
+| 7 | **Batch mmap kernel call** — map multiple pages in a single `int 0x80` trap, amortizing per-page trap overhead | model_load, ctx_create | model_load: 16.3s → 13.0s (**20%**); ctx_create: 2.3s → 1.8s (**22%**) | **Done** ✅ |
+| 8 | **Larger stdio buffers (setvbuf)** — override `ggml_fopen` to use 256 KB buffer instead of newlib's 1 KB BUFSIZ | model_load | Reduces fread syscalls from 462K to 1,800 | **Done** ✅ |
 
 ### Remaining Bottlenecks
 
 | # | Optimization | Target Phase | Expected Improvement | Complexity |
 |---|-------------|--------------|---------------------|------------|
-| 7 | **Reduce model_load POSIX overhead** — bypass newlib/libposix layers entirely for GGUF loading; serve reads directly from MMIO pointer via a custom file-like interface | model_load | 5–10x faster (16s → 2–3s) | Medium |
-| 8 | **Faster context allocation** — pre-map heap pages or batch page table updates for large allocations | ctx_create | 10–100x faster (2.3s → ~50ms) | Medium |
-| 9 | **Reduce KVM VM-exit frequency** — lower timer interrupt rate, disable unnecessary APIC emulation | generation | 1.3–1.5x (eliminate ~20ms/tok overhead) | Low–Medium |
-| 10 | **x86_64 port** — run Nanvix in 64-bit mode | generation | 1.2–1.5x faster decode | Very High |
+| 9 | **Faster per-page kernel work** — optimize frame allocator and page table insertion (batch TLB flush, contiguous frame alloc) | model_load, ctx_create | 2–5x faster (13s → 3–6s) | Medium |
+| 10 | **Reduce KVM VM-exit frequency** — lower timer interrupt rate, disable unnecessary APIC emulation | generation | 1.2–1.3x (eliminate ~10ms/tok overhead) | Low–Medium |
+| 11 | **x86_64 port** — run Nanvix in 64-bit mode | generation | 1.2–1.5x faster decode | Very High |
 
 ### Projected Performance
 
-With optimizations #7–#8, end-to-end time for 32 tokens could drop from 20.3s to ~5s. For 256 tokens, from 32.2s to ~15s. The generation phase is already near-optimal per the guest clock; the remaining host wall-clock overhead (~20 ms/tok) is KVM scheduling cost that would require VM-level optimizations to address.
+With optimization #9, end-to-end time for 32 tokens could drop from 16.6s to ~6–9s. For 256 tokens, from 28.8s to ~20s. The generation phase is already near-optimal per the guest clock; the remaining host wall-clock overhead (~10ms/tok) is KVM scheduling cost that would require VM-level optimizations to address.
