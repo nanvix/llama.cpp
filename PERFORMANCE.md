@@ -395,9 +395,18 @@ g++ -O2 -std=c++17 -Iinclude -Iggml/include \
 
 | # | Optimization | Target Phase | Expected Improvement | Complexity |
 |---|-------------|--------------|---------------------|------------|
-| 14 | **4MB PSE large pages** — use x86 PSE to map 4MB pages, reducing 118K PTEs to 114 PDEs | model_load | 4x faster (2.0s → ~0.5s) | High |
-| 15 | **x86_64 port** — run Nanvix in 64-bit mode | generation | 1.1–1.3x faster decode | Very High |
+| 14 | **4MB PSE large pages** — use x86 PSE to map 4MB pages in non-PAE mode, reducing 118K PTEs to 114 PDEs. Requires: CR4.PSE enable, PDE.PS bit support, 4MB-aligned frame allocation, new map/unmap paths | model_load | 4x faster (2.0s → ~0.5s) | High |
+| 15 | **Demand paging** — defer page mapping to first access via page fault handler; only map pages that are actually touched during model loading, avoid mapping unused heap pages | model_load | 10–30% (fewer total pages mapped) | Medium |
+| 16 | **Interrupt-driven IKC** — configure vmbus to generate an interrupt (e.g., MMIO doorbell) when an IKC message arrives, replacing the PAUSE-based busy-poll in the kernel idle loop. Reduces host CPU usage during IPC-heavy phases and eliminates wasted spin cycles | IPC latency, host CPU | Neutral on throughput; lowers host CPU from 100% to near-idle during waits | Medium |
+| 17 | **Reduce stderr log output** — suppress or batch llama.cpp's model-loader metadata prints (34 KV lines + tensor info) that each require an IPC round-trip to linuxd; redirect to /dev/null or buffer in guest | model_load | 5–10% (eliminate ~100 IPC round-trips during metadata logging) | Low |
+| 18 | **Pre-map heap at startup** — allocate and map all user-pool frames at process creation time, so that `mmap_range` during model loading becomes a no-op (frames already present). Trades boot time for model-load time | model_load | 2–3x (move EPT cost to boot, overlap with kernel init) | Medium |
+| 19 | **KVM dirty-page tracking opt-out** — disable KVM dirty-page tracking (KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2) for the guest memory region, since Nanvix does not live-migrate. Reduces EPT overhead on page writes | model_load, generation | 5–15% (fewer EPT faults on page writes) | Low |
+| 20 | **x86_64 port** — run Nanvix in 64-bit long mode with 2MB huge pages (via PDE.PS in 4-level paging). Enables wider registers for compute, larger address space, and native 2MB page support without PSE workarounds | generation, model_load | 1.1–1.3x decode; model_load: ~0.5s with 2MB pages | Very High |
+| 21 | **Specialize single-process scheduler** — bypass all scheduler overhead (quantum tracking, ready-queue management, context switch) when only one user process is running. The kernel event loop can poll IKC inline and return directly to the user thread | all phases | 3–5% (eliminate ~100 wasted scheduler invocations per second) | Low–Medium |
+| 22 | **KVM PV clock / TSC-based time** — use `kvm_clock` or raw TSC (rdtsc) for `clock_gettime()` instead of PIT-tick counting. Provides nanosecond resolution without depending on timer interrupt frequency | time accuracy | No throughput impact; fixes 10ms guest-time granularity at 100 Hz | Low |
 
 ### Projected Performance
 
-With optimization #14 (4MB large pages), model_load could drop from 2.0s to ~0.5s (matching native), bringing the 32-token total from 3.6s to ~2.1s (1.04x native). The generation phase at 1.2x host overhead is the remaining bottleneck, dominated by residual KVM scheduling cost.
+With optimization #14 (4MB large pages), model_load could drop from 2.0s to ~0.5s (matching native), bringing the 32-token total from 3.6s to ~2.1s (~1.0x native). With #20 (x86_64 + 2MB pages), both model loading and generation benefit: the 256-token total could drop from 12.4s to ~9.5s (1.1x native).
+
+The remaining overhead after all feasible optimizations would be the irreducible KVM cost: EPT page-table walks for every guest memory access (~2–5% overhead) and VM-exit latency for any remaining interrupt or I/O trap.
